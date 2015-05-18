@@ -28,6 +28,7 @@ use jsapi::{ToInt32Slow, ToUint32Slow, ToUint16Slow, ToInt64Slow, ToUint64Slow};
 use jsapi::{JSAutoRequest, JS_BeginRequest, JS_EndRequest};
 use jsapi::{JSAutoCompartment, JS_EnterCompartment, JS_LeaveCompartment};
 use jsapi::{JSJitMethodCallArgs, JSJitGetterCallArgs, JSJitSetterCallArgs, CallArgs};
+use jsapi::{IncrementalValueBarrier, IncrementalObjectBarrier};
 use jsapi::{JSVAL_NULL, JSVAL_VOID, JSID_VOID};
 use jsval::UndefinedValue;
 use glue::{CreateAutoObjectVector, AppendToAutoObjectVector, DeleteAutoObjectVector};
@@ -286,12 +287,14 @@ pub trait GCMethods<T> {
     fn needs_post_barrier(v: T) -> bool;
     unsafe fn post_barrier(v: *mut T);
     unsafe fn relocate(v: *mut T);
+    unsafe fn incremental_barrier(v: &T);
 }
 
 impl GCMethods<jsid> for jsid {
     fn needs_post_barrier(_: jsid) -> bool { return false; }
     unsafe fn post_barrier(_: *mut jsid) { unreachable!() }
     unsafe fn relocate(_: *mut jsid) { unreachable!() }
+    unsafe fn incremental_barrier(_: &jsid) {}
 }
 
 impl GCMethods<*mut JSObject> for *mut JSObject {
@@ -303,6 +306,12 @@ impl GCMethods<*mut JSObject> for *mut JSObject {
     }
     unsafe fn relocate(v: *mut *mut JSObject) {
         HeapCellRelocate(mem::transmute(v));
+    }
+    unsafe fn incremental_barrier(v: &*mut JSObject) {
+        if v.is_null() {
+            return;
+        }
+        IncrementalObjectBarrier(*v);
     }
 }
 
@@ -316,6 +325,12 @@ impl GCMethods<*mut JSString> for *mut JSString {
     unsafe fn relocate(v: *mut *mut JSString) {
         HeapCellRelocate(mem::transmute(v));
     }
+    unsafe fn incremental_barrier(v: &*mut JSString) {
+        if v.is_null() {
+            return;
+        }
+        IncrementalObjectBarrier(mem::transmute(*v));
+    }
 }
 
 impl GCMethods<*mut JSScript> for *mut JSScript {
@@ -328,6 +343,12 @@ impl GCMethods<*mut JSScript> for *mut JSScript {
     unsafe fn relocate(v: *mut *mut JSScript) {
         HeapCellRelocate(mem::transmute(v));
     }
+    unsafe fn incremental_barrier(v: &*mut JSScript) {
+        if v.is_null() {
+            return;
+        }
+        IncrementalObjectBarrier(mem::transmute(*v));
+    }
 }
 
 impl GCMethods<*mut JSFunction> for *mut JSFunction {
@@ -339,6 +360,12 @@ impl GCMethods<*mut JSFunction> for *mut JSFunction {
     }
     unsafe fn relocate(v: *mut *mut JSFunction) {
         HeapCellRelocate(mem::transmute(v));
+    }
+    unsafe fn incremental_barrier(v: &*mut JSFunction) {
+        if v.is_null() {
+            return;
+        }
+        IncrementalObjectBarrier(mem::transmute(*v));
     }
 }
 
@@ -353,10 +380,17 @@ impl GCMethods<Value> for Value {
     unsafe fn relocate(v: *mut Value) {
         HeapValueRelocate(v);
     }
+    unsafe fn incremental_barrier(v: &Value) {
+        if !v.is_object() {
+            return;
+        }
+        IncrementalValueBarrier(v as *const _);
+    }
 }
 
 impl<T: GCMethods<T> + Copy> Heap<T> {
     pub fn set(&mut self, v: T) {
+        unsafe { T::incremental_barrier(&self.ptr) };
         if T::needs_post_barrier(v) {
             self.ptr = v;
             unsafe { T::post_barrier(&mut self.ptr) };
@@ -384,6 +418,7 @@ impl<T: Default + GCMethods<T> + Copy> Default for Heap<T> {
 
 impl<T: GCMethods<T> + Copy> Drop for Heap<T> {
     fn drop(&mut self) {
+        unsafe { T::incremental_barrier(&self.ptr) };
         if T::needs_post_barrier(self.ptr) {
             unsafe { T::relocate(&mut self.ptr) };
         }
